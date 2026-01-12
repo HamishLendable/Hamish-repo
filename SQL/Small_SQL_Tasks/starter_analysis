@@ -1,0 +1,830 @@
+// PRICING DATA
+
+/* 1. AVERAGE INTEREST RATE MONITOR
+   - Purpose: distinct view of pricing consistency.
+*/
+SELECT
+    INTRODUCER_CATEGORY AS CHANNEL,
+    ORIGINATION_SIMPLIFIED_RISK_GRADE AS RISK_GRADE,
+    
+    ROUND(AVG(FINAL_INTEREST_RATE), 2) AS AVG_INTEREST_RATE,
+    COUNT(*) AS TOTAL_LOANS
+
+FROM
+    PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR
+WHERE
+    FLAG_ORIGINATED = 1
+    AND ORIGINATION_DATETIME >= '2024-01-01'
+GROUP BY
+    1, 2
+ORDER BY
+    1, 2;
+
+
+
+/* 2. INTEREST RATE SPREAD (Dynamic Benchmark)
+   - Benchmark: Adjusted by Risk Grade (A-F).
+   - Logic: Final Rate - Grade Specific Cost of Funds.
+*/
+SELECT
+    INTRODUCER_CATEGORY AS CHANNEL,
+    ORIGINATION_SIMPLIFIED_RISK_GRADE AS RISK_GRADE,
+    
+    ROUND(
+        AVG(
+            FINAL_INTEREST_RATE - CASE 
+                WHEN ORIGINATION_SIMPLIFIED_RISK_GRADE = 'A' THEN 4.50 
+                WHEN ORIGINATION_SIMPLIFIED_RISK_GRADE = 'B' THEN 5.25
+                WHEN ORIGINATION_SIMPLIFIED_RISK_GRADE = 'C' THEN 6.00
+                WHEN ORIGINATION_SIMPLIFIED_RISK_GRADE = 'D' THEN 7.50
+                WHEN ORIGINATION_SIMPLIFIED_RISK_GRADE LIKE 'E%' THEN 9.00
+                WHEN ORIGINATION_SIMPLIFIED_RISK_GRADE LIKE 'F%' THEN 11.00
+                ELSE 5.0 -- Fallback default
+            END
+        ), 2
+    ) AS AVG_RATE_SPREAD
+
+FROM
+    PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR
+WHERE
+    FLAG_ORIGINATED = 1
+    AND ORIGINATION_DATETIME >= '2024-01-01'
+GROUP BY
+    1, 2
+ORDER BY
+    1, 2;
+
+
+/* 2. INTEREST RATE SPREAD
+   - Benchmark: 4.5% (Base Rate) + ACTUAL Default Rate for that Grade.
+   - Purpose: Ensures high-risk grades have a higher hurdle to clear.
+*/
+
+WITH GRADE_RISK_PERFORMANCE AS (
+    -- 1. Calculate the Risk Premium per Grade based on real performance
+    SELECT
+        t1.ORIGINATION_SIMPLIFIED_RISK_GRADE AS RISK_GRADE,
+        
+        -- The "Risk Premium" = The Actual Default Rate %
+        ROUND(
+            (SUM(CASE WHEN t2.DAYS_PAST_DUE > 90 THEN 1 ELSE 0 END) / 
+             NULLIF(COUNT(DISTINCT t1.LOAN_ID), 0)) * 100, 
+            2
+        ) AS ACTUAL_RISK_PREMIUM
+
+    FROM
+        PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR t1
+    LEFT JOIN (
+        SELECT 
+            LOAN_ID, DAYS_PAST_DUE, _FIVETRAN_SYNCED
+        FROM 
+            RAW_PRODUCTION.LOANS_UK_CREDIT_LOANS_ARREARS.PAYMENTARREARS
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY LOAN_ID ORDER BY _FIVETRAN_SYNCED DESC) = 1
+    ) t2 
+        ON TO_VARCHAR(t1.LOAN_ID) = TO_VARCHAR(t2.LOAN_ID)
+
+    WHERE
+        t1.FLAG_ORIGINATED = 1
+        AND t1.ORIGINATION_DATETIME >= '2023-01-01' -- Wide window to get accurate risk data
+    GROUP BY
+        1
+)
+
+SELECT
+    t1.INTRODUCER_CATEGORY AS CHANNEL,
+    t1.ORIGINATION_SIMPLIFIED_RISK_GRADE AS RISK_GRADE,
+    
+    -- 1. The Rate you charged the customer
+    ROUND(AVG(t1.FINAL_INTEREST_RATE), 2) AS AVG_CUSTOMER_RATE,
+    
+    -- 2. The Calculated Internal Cost (Base Rate 4.5% + Actual Risk Premium)
+    ROUND(
+        AVG(4.5 + COALESCE(rp.ACTUAL_RISK_PREMIUM, 0)), 
+        2
+    ) AS CALCULATED_COST_OF_CAPITAL,
+    
+    -- 3. The True Spread (Profitability)
+    ROUND(
+        AVG(t1.FINAL_INTEREST_RATE - (4.5 + COALESCE(rp.ACTUAL_RISK_PREMIUM, 0))), 
+        2
+    ) AS AVG_TRUE_SPREAD
+
+FROM
+    PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR t1
+LEFT JOIN 
+    GRADE_RISK_PERFORMANCE rp 
+    ON t1.ORIGINATION_SIMPLIFIED_RISK_GRADE = rp.RISK_GRADE
+
+WHERE
+    t1.FLAG_ORIGINATED = 1
+    AND t1.ORIGINATION_DATETIME >= '2024-01-01' -- Focus on recent booking for the final view
+
+GROUP BY
+    1, 2
+ORDER BY
+    1, 2;
+    
+
+
+
+/* 3. AVERAGE LOAN AMOUNT & VOLUME SHARE
+   - New Column: VOLUME_PERCENTAGE
+   - Logic: Calculates (Row Count / Total Count) * 100
+*/
+SELECT
+    INTRODUCER_CATEGORY AS CHANNEL,
+    ORIGINATION_SIMPLIFIED_RISK_GRADE AS RISK_GRADE,
+    
+    -- The Average Size
+    ROUND(AVG(FINAL_NET_AMOUNT), 0) AS AVG_LOAN_AMOUNT,
+    
+    -- The Raw Count
+    COUNT(*) AS VOLUME,
+    
+    -- The Percentage Share (Window Function)
+    ROUND(
+        100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 
+        2
+    ) AS VOLUME_PERCENTAGE
+
+FROM
+    PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR
+WHERE
+    FLAG_ORIGINATED = 1
+    AND ORIGINATION_DATETIME >= '2024-01-01'
+GROUP BY
+    1, 2
+ORDER BY
+    1, 2;
+
+
+
+
+
+
+/* 4. PRICE ELASTICITY: THE FULL SPECTRUM (SCAFFOLDED)
+   - 1. Creates a "Spine" of rates (0% to 50%) using a Generator.
+   - 2. Cross Joins with Risk Grades to ensure EVERY bucket appears.
+   - 3. Fixes the "0-1%" bug by multiplying decimal rates by 100.
+   - 4. Still organised by risk grade
+*/
+
+WITH RATE_SPINE AS (
+    -- 1. Create numbers 0 to 50 to represent every 1% bucket
+    SELECT ROW_NUMBER() OVER (ORDER BY SEQ4()) - 1 AS RATE_BUCKET
+    FROM TABLE(GENERATOR(ROWCOUNT => 51)) -- Generates 0, 1, ... 50
+),
+
+RISK_GRADES AS (
+    -- 2. Get the list of all unique Risk Grades
+    SELECT DISTINCT INSERTION_SIMPLIFIED_RISK_GRADE AS RISK_GRADE
+    FROM PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR
+    WHERE INSERTION_SIMPLIFIED_RISK_GRADE IS NOT NULL
+),
+
+THE_GRID AS (
+    -- 3. Ensure every Risk Grade gets every bucket
+    SELECT 
+        r.RISK_GRADE, 
+        s.RATE_BUCKET
+    FROM RISK_GRADES r
+    CROSS JOIN RATE_SPINE s
+),
+
+ACTUAL_DATA AS (
+    -- 4. The Real Data (With the Decimal Fix)
+    SELECT 
+        INSERTION_SIMPLIFIED_RISK_GRADE AS RISK_GRADE,
+        -- The Fix: Multiply by 100 to turn 0.15 into 15.0
+        FLOOR(INSERTION_INTEREST_RATE * 100) AS RATE_FLOOR,
+        FLAG_QUOTED,
+        FLAG_ORIGINATED
+    FROM 
+        PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR
+    WHERE 
+        APPLICATION_CREATED_DATETIME >= '2024-01-01'
+        AND FLAG_QUOTED = 1
+        AND INSERTION_INTEREST_RATE IS NOT NULL
+)
+
+-- 5. The Final Join
+SELECT
+    grid.RISK_GRADE,
+    
+    -- Clear Labeling
+    CONCAT(grid.RATE_BUCKET, '% - ', grid.RATE_BUCKET + 1, '%') AS INTEREST_RATE_BUCKET,
+    
+    -- Metrics (Using COALESCE to show 0 instead of NULL for empty buckets)
+    COUNT(data.FLAG_QUOTED) AS TOTAL_QUOTES_OFFERED,
+    COALESCE(SUM(data.FLAG_ORIGINATED), 0) AS TOTAL_LOANS_BOOKED,
+    
+    -- Conversion Rate
+    ROUND(
+        (COALESCE(SUM(data.FLAG_ORIGINATED), 0) / NULLIF(COUNT(data.FLAG_QUOTED), 0)) * 100, 
+        2
+    ) AS CONVERSION_RATE_PCT
+
+FROM 
+    THE_GRID grid
+LEFT JOIN 
+    ACTUAL_DATA data 
+    ON grid.RISK_GRADE = data.RISK_GRADE 
+    AND grid.RATE_BUCKET = data.RATE_FLOOR
+
+GROUP BY 
+    1, 2, grid.RATE_BUCKET
+ORDER BY 
+    1, grid.RATE_BUCKET;
+
+
+/* 5. PRICE ELASTICITY: PURE RATE SENSITIVITY
+   - Dimension: Strictly Interest Rate Buckets (1% Bands).
+   - Range: 0% to 50% (Covering all realistic motor finance rates).
+   - Logic: Aggregates all traffic into these bands regardless of Risk Grade.
+*/
+
+WITH RATE_SPINE AS (
+    -- 1. Generate numbers 0 to 50 to represent every 1% bucket
+    SELECT ROW_NUMBER() OVER (ORDER BY SEQ4()) - 1 AS RATE_BUCKET
+    FROM TABLE(GENERATOR(ROWCOUNT => 51)) 
+),
+
+ACTUAL_DATA AS (
+    -- 2. The Real Data (Aggregated across all grades/channels)
+    SELECT 
+        -- Multiply Decimal Rate (0.15) by 100 to get Integer (15)
+        FLOOR(INSERTION_INTEREST_RATE * 100) AS RATE_FLOOR,
+        FLAG_QUOTED,
+        FLAG_ORIGINATED
+    FROM 
+        PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR
+    WHERE 
+        APPLICATION_CREATED_DATETIME >= '2024-01-01'
+        AND FLAG_QUOTED = 1
+        AND INSERTION_INTEREST_RATE IS NOT NULL
+)
+
+-- 3. The Final Join (Spine LEFT JOIN Data)
+SELECT
+    -- Clear Labeling
+    CONCAT(s.RATE_BUCKET, '% - ', s.RATE_BUCKET + 1, '%') AS INTEREST_RATE_BUCKET,
+    
+    -- Metrics (showing 0 for empty buckets)
+    COUNT(d.FLAG_QUOTED) AS TOTAL_QUOTES_OFFERED,
+    COALESCE(SUM(d.FLAG_ORIGINATED), 0) AS TOTAL_LOANS_BOOKED,
+    
+    -- Conversion Rate
+    ROUND(
+        (COALESCE(SUM(d.FLAG_ORIGINATED), 0) / NULLIF(COUNT(d.FLAG_QUOTED), 0)) * 100, 
+        2
+    ) AS CONVERSION_RATE_PCT
+
+FROM 
+    RATE_SPINE s
+LEFT JOIN 
+    ACTUAL_DATA d 
+    ON s.RATE_BUCKET = d.RATE_FLOOR
+
+GROUP BY 
+    s.RATE_BUCKET
+ORDER BY 
+    s.RATE_BUCKET;    
+
+
+
+
+
+
+
+
+// CREDIT STRATEGY DATA
+
+/* 1. APPROVAL RATE QUERY
+   - Denominator: All applications.
+   - Numerator: Applications where FLAG_QUOTED = 1 (Passed credit/risk checks).
+   - Not that useful but will to group by date but will keep for completeness
+*/
+SELECT
+    DATE(APPLICATION_CREATED_DATETIME) AS APP_DATE,
+    
+    COUNT(*) AS TOTAL_APPLICATIONS,
+    SUM(FLAG_QUOTED) AS APPROVED_APPLICATIONS,
+    
+    ROUND(
+        (SUM(FLAG_QUOTED) / NULLIF(COUNT(*), 0)) * 100, 
+        2
+    ) AS APPROVAL_RATE_PERCENT
+
+FROM
+    PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR
+WHERE
+    APPLICATION_CREATED_DATETIME >= '2024-01-01'
+GROUP BY
+    APP_DATE
+ORDER BY
+    APP_DATE;
+
+
+/*  1. (Again) APPROVAL RATE BY CHANNEL
+   - Dimension: INTRODUCER_CATEGORY (The source of the business).
+   - Metrics: Total Apps, Approved Apps, and Conversion %.
+*/
+
+SELECT
+    INTRODUCER_CATEGORY AS CHANNEL,
+    
+    COUNT(*) AS TOTAL_APPLICATIONS,
+    SUM(FLAG_QUOTED) AS APPROVED_APPLICATIONS,
+    
+    ROUND(
+        (SUM(FLAG_QUOTED) / NULLIF(COUNT(*), 0)) * 100, 
+        2
+    ) AS APPROVAL_RATE_PERCENT
+
+FROM
+    PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR
+WHERE
+    APPLICATION_CREATED_DATETIME >= '2024-01-01'
+
+GROUP BY
+    1 -- Groups by INTRODUCER_CATEGORY
+ORDER BY
+    1; -- Sorts Alphabetically
+
+
+/* 2. AVERAGE CREDIT SCORE QUERY
+   - Filter: Only includes 'Approved' (Quoted) applicants.
+   - Grouping: Broken down by Risk Grade for granular insight.
+*/
+SELECT
+    INSERTION_SIMPLIFIED_RISK_GRADE AS RISK_GRADE,
+    
+    COUNT(*) AS APPROVED_COUNT,
+    ROUND(AVG(DELPHI_SCORE), 0) AS AVG_CREDIT_SCORE
+
+FROM
+    PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR
+WHERE
+    FLAG_QUOTED = 1 -- Only look at those who passed the check
+    AND APPLICATION_CREATED_DATETIME >= '2024-01-01'
+    AND DELPHI_SCORE IS NOT NULL
+GROUP BY
+    1
+ORDER BY
+    1;
+
+
+/* 3. CREDIT RISK: DEFAULT RATE BY GRADE
+   - 2023 onwards, seems low.
+*/
+
+SELECT
+    t1.ORIGINATION_SIMPLIFIED_RISK_GRADE AS RISK_GRADE,
+    
+    -- Denominator: Total Booked Loans
+    COUNT(DISTINCT t1.LOAN_ID) AS TOTAL_LOANS_BOOKED,
+    
+    -- Numerator: Defaults
+    SUM(CASE WHEN COALESCE(t2.DAYS_PAST_DUE, 0) > 90 THEN 1 ELSE 0 END) AS TOTAL_DEFAULTS,
+    
+    -- The Key Metric
+    ROUND(
+        (SUM(CASE WHEN COALESCE(t2.DAYS_PAST_DUE, 0) > 90 THEN 1 ELSE 0 END) / 
+        NULLIF(COUNT(DISTINCT t1.LOAN_ID), 0)) * 100, 
+        2
+    ) AS DEFAULT_RATE_PCT
+
+FROM
+    PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR t1
+LEFT JOIN (
+    SELECT 
+        LOAN_ID, 
+        DAYS_PAST_DUE,
+        _FIVETRAN_SYNCED
+    FROM 
+        RAW_PRODUCTION.LOANS_UK_CREDIT_LOANS_ARREARS.PAYMENTARREARS
+    -- Keep only the most recent update for every loan
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY LOAN_ID ORDER BY _FIVETRAN_SYNCED DESC) = 1
+) t2 
+    ON t1.LOAN_ID = t2.LOAN_ID
+
+WHERE
+    t1.FLAG_ORIGINATED = 1
+    AND t1.ORIGINATION_DATETIME >= '2023-01-01' -- Sufficient seasoning window
+
+GROUP BY
+    1
+ORDER BY
+    1;
+
+
+/* CREDIT RISK: DEFAULT RATE (2024+)
+   - Date Filter: 2024-01-01 onwards.
+   - Still seems low... maybe im missing something.
+*/
+
+SELECT
+    t1.ORIGINATION_SIMPLIFIED_RISK_GRADE AS RISK_GRADE,
+    
+    -- Volume: Total Loans originated in period
+    COUNT(DISTINCT t1.LOAN_ID) AS TOTAL_LOANS_BOOKED,
+    
+    -- Debug Column: How many loans actually found a match in arrears table?
+
+    COUNT(DISTINCT t2.LOAN_ID) AS MATCHED_IN_ARREARS_DATA,
+    
+    -- Numerator: Defaults (>90 Days Past Due)
+    SUM(CASE 
+        WHEN t2.DAYS_PAST_DUE > 90 THEN 1 
+        ELSE 0 
+    END) AS TOTAL_DEFAULTS,
+    
+    -- The Default Rate
+    ROUND(
+        (SUM(CASE WHEN t2.DAYS_PAST_DUE > 90 THEN 1 ELSE 0 END) / 
+        NULLIF(COUNT(DISTINCT t1.LOAN_ID), 0)) * 100, 
+        2
+    ) AS DEFAULT_RATE_PCT
+
+FROM
+    PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR t1
+LEFT JOIN (
+    SELECT 
+        LOAN_ID, 
+        DAYS_PAST_DUE,
+        _FIVETRAN_SYNCED
+    FROM 
+        RAW_PRODUCTION.LOANS_UK_CREDIT_LOANS_ARREARS.PAYMENTARREARS
+    -- Keep only the most recent snapshot
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY LOAN_ID ORDER BY _FIVETRAN_SYNCED DESC) = 1
+) t2 
+    -- SAFE JOIN: Force both IDs to string to ensure '123' matches '123'
+    ON TO_VARCHAR(t1.LOAN_ID) = TO_VARCHAR(t2.LOAN_ID)
+
+WHERE
+    t1.FLAG_ORIGINATED = 1
+    AND t1.ORIGINATION_DATETIME >= '2024-01-01'
+
+GROUP BY
+    1
+ORDER BY
+    1;
+
+
+
+
+
+
+
+
+//ORIGINATION FUNNEL METRIC
+
+
+/* 1. APPLICATION VOLUME
+   - Metric: Total applications received.
+   - Breakdown: By Channel (Introducer Category) and Month.
+   - Grouping: Explicitly by INTRODUCER_CATEGORY (Channel).
+   - Metric: Percentage of total volume using a Window Function.
+*/
+
+SELECT
+    INTRODUCER_CATEGORY AS CHANNEL,
+    
+    -- Absolute Volume
+    COUNT(*) AS TOTAL_APPLICATIONS,
+    
+    -- Relative Share (Row Count / Total Count of all rows)
+    ROUND(
+        100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 
+        2
+    ) AS APPLICATION_SHARE_PCT
+
+FROM
+    PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR
+WHERE
+    APPLICATION_CREATED_DATETIME >= '2024-01-01'
+
+GROUP BY
+    INTRODUCER_CATEGORY -- Explicit grouping for clarity
+ORDER BY
+    TOTAL_APPLICATIONS DESC;
+
+
+
+
+/* 2. OVERALL CONVERSION RATE
+   - Denominator: Total Applications.
+   - Numerator: Loans Originated (Funded).
+*/
+SELECT
+    INTRODUCER_CATEGORY AS CHANNEL,
+    
+    COUNT(*) AS TOTAL_APPLICATIONS,
+    SUM(FLAG_ORIGINATED) AS TOTAL_ORIGINATIONS,
+    
+    ROUND(
+        (SUM(FLAG_ORIGINATED) / NULLIF(COUNT(*), 0)) * 100, 
+        2
+    ) AS CONVERSION_RATE_PCT
+FROM
+    PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR
+WHERE
+    APPLICATION_CREATED_DATETIME >= '2024-01-01'
+GROUP BY
+    1
+ORDER BY
+    4 DESC;
+
+
+
+/* 3. TIME TO PROCESS (Speed to Funding)
+   - Metric: Average & Median hours from Application to Origination.
+   - Filter: Only considers successful loans.
+*/
+SELECT
+    INTRODUCER_CATEGORY AS CHANNEL,
+    
+    -- Average Time (Hours)
+    ROUND(
+        AVG(TIMEDIFF(HOUR, APPLICATION_CREATED_DATETIME, ORIGINATION_DATETIME)), 
+        1
+    ) AS AVG_HOURS_TO_ORIGINATE,
+    
+    -- Median Time (Often better as it ignores outliers)
+    ROUND(
+        MEDIAN(TIMEDIFF(HOUR, APPLICATION_CREATED_DATETIME, ORIGINATION_DATETIME)), 
+        1
+    ) AS MEDIAN_HOURS_TO_ORIGINATE
+
+FROM
+    PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR
+WHERE
+    FLAG_ORIGINATED = 1
+    AND APPLICATION_CREATED_DATETIME >= '2024-01-01'
+GROUP BY
+    1
+ORDER BY
+    2;
+
+
+/* TIME TO PROCESS: HOURLY DISTRIBUTION BY CHANNEL
+   - Scaffold: 0 to 500 Hours.
+   - Metric: Hours elapsed between App Creation and Origination.
+   - Percentage: Calculated relative to the specific Channel's total volume.
+*/
+
+WITH HOUR_SPINE AS (
+    -- 1. Generate numbers 0 to 500 to represent hour buckets
+    SELECT ROW_NUMBER() OVER (ORDER BY SEQ4()) - 1 AS HOUR_BUCKET
+    FROM TABLE(GENERATOR(ROWCOUNT => 500)) 
+),
+
+CHANNELS AS (
+    -- 2. Get the list of all active Channels
+    SELECT DISTINCT INTRODUCER_CATEGORY AS CHANNEL
+    FROM PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR
+    WHERE INTRODUCER_CATEGORY IS NOT NULL
+),
+
+THE_GRID AS (
+    -- 3. Cartesian Join: Every Channel gets every Hour Bucket
+    SELECT 
+        c.CHANNEL, 
+        s.HOUR_BUCKET
+    FROM CHANNELS c
+    CROSS JOIN HOUR_SPINE s
+),
+
+ACTUAL_DATA AS (
+    -- 4. Calculate the Process Time for each loan
+    SELECT 
+        INTRODUCER_CATEGORY AS CHANNEL,
+        -- Calculate difference in Hours
+        DATEDIFF('hour', APPLICATION_CREATED_DATETIME, ORIGINATION_DATETIME) AS HOURS_TAKEN
+    FROM 
+        PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR
+    WHERE 
+        FLAG_ORIGINATED = 1
+        AND APPLICATION_CREATED_DATETIME >= '2024-01-01'
+        -- Filter out crazy outliers (negative time or > 1 year)
+        AND ORIGINATION_DATETIME > APPLICATION_CREATED_DATETIME
+)
+
+-- 5. The Final Join and Calculation
+SELECT
+    grid.CHANNEL,
+    
+    -- Clear Labeling (e.g., "0h - 1h")
+    CONCAT(grid.HOUR_BUCKET, 'h - ', grid.HOUR_BUCKET + 1, 'h') AS TIME_BUCKET,
+    
+    -- Raw Volume in this bucket
+    COUNT(data.HOURS_TAKEN) AS LOANS_PROCESSED,
+    
+    -- The Key Metric: % of that Channel's total volume
+    -- logic: (Count in Bucket / Total Count for Channel) * 100
+    ROUND(
+        100.0 * COUNT(data.HOURS_TAKEN) / 
+        NULLIF(SUM(COUNT(data.HOURS_TAKEN)) OVER (PARTITION BY grid.CHANNEL), 0),
+        2
+    ) AS PCT_OF_CHANNEL_VOLUME
+
+FROM 
+    THE_GRID grid
+LEFT JOIN 
+    ACTUAL_DATA data 
+    ON grid.CHANNEL = data.CHANNEL 
+    AND grid.HOUR_BUCKET = data.HOURS_TAKEN
+
+GROUP BY 
+    grid.CHANNEL, grid.HOUR_BUCKET
+ORDER BY 
+    grid.CHANNEL, grid.HOUR_BUCKET;
+
+
+
+/* 4. ASSET PROFILE (Approved Vehicles)
+   - Metrics: LTV, Vehicle Age, Mileage.
+   - LTV Calculation: Loan Amount / Vehicle Value.
+*/
+SELECT
+    INTRODUCER_CATEGORY AS CHANNEL,
+    
+    -- Loan to Value (LTV) %
+    ROUND(AVG(FINAL_NET_AMOUNT / NULLIF(FINAL_VEHICLE_VALUE, 0)) * 100, 1) AS AVG_LTV_PCT,
+    
+    -- Vehicle Age (Converted from Months to Years)
+    ROUND(AVG(FINAL_VEHICLE_AGE_IN_MONTHS) / 12, 1) AS AVG_VEHICLE_AGE_YEARS,
+    
+    -- Average Mileage
+    ROUND(AVG(FINAL_VEHICLE_MILEAGE), 0) AS AVG_MILEAGE,
+    
+    COUNT(*) AS TOTAL_VEHICLES
+FROM
+    PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR
+WHERE
+    FLAG_ORIGINATED = 1
+    AND APPLICATION_CREATED_DATETIME >= '2024-01-01'
+GROUP BY
+    1
+ORDER BY
+    1;
+
+
+
+/* 5. FUNNEL DROP-OFF ANALYSIS
+   - Methodology: Tracks volume at each milestone.
+   - Conversion Metrics: Calculates the % success rate from the PREVIOUS stage.
+*/
+SELECT
+    INTRODUCER_CATEGORY AS CHANNEL,
+    
+    -- Absolute Volumes
+    COUNT(*) AS STEP_1_APPS,
+    SUM(FLAG_QUOTED) AS STEP_2_QUOTED,
+    SUM(FLAG_LOAN_CONTRACT_ACCEPTED) AS STEP_3_CONTRACT_ACCEPTED,
+    SUM(FLAG_ORIGINATED) AS STEP_4_ORIGINATED,
+    
+    -- Stage-by-Stage Conversion Rates
+    -- 1. Approval Rate (App -> Quote)
+    ROUND((SUM(FLAG_QUOTED) / NULLIF(COUNT(*), 0)) * 100, 1) AS APP_TO_QUOTE_PCT,
+    
+    -- 2. Take-up Rate (Quote -> Contract) - Does the customer like the price?
+    ROUND((SUM(FLAG_LOAN_CONTRACT_ACCEPTED) / NULLIF(SUM(FLAG_QUOTED), 0)) * 100, 1) AS QUOTE_TO_CONTRACT_PCT,
+    
+    -- 3. Fulfillment Rate (Contract -> Funded) - Did the paperwork/fraud checks pass?
+    ROUND((SUM(FLAG_ORIGINATED) / NULLIF(SUM(FLAG_LOAN_CONTRACT_ACCEPTED), 0)) * 100, 1) AS CONTRACT_TO_FUNDED_PCT
+
+FROM
+    PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR
+WHERE
+    APPLICATION_CREATED_DATETIME >= '2024-01-01'
+GROUP BY
+    1
+ORDER BY
+    1;
+
+
+
+
+//CREDIT PERFORMANCE DATA
+
+/* 1.DELINQUENCY BY VINTAGE & SEASONING
+   - Focus: Performance of loans at different ages (Months on Book).
+   - Metrics: 30+ DPD (Warning Sign) and 90+ DPD (Default).
+*/
+
+SELECT
+    -- 1. The Cohort (When was it sold?)
+    TO_VARCHAR(t1.ORIGINATION_DATETIME, 'YYYY-MM') AS ORIGINATION_COHORT,
+    
+    -- 2. The Risk Grade
+    t1.ORIGINATION_SIMPLIFIED_RISK_GRADE AS RISK_GRADE,
+    
+    -- 3. Seasoning (How old is the loan today?)
+    DATEDIFF('month', t1.ORIGINATION_DATETIME, CURRENT_DATE()) AS MONTHS_ON_BOOK,
+    
+    -- Volume
+    COUNT(DISTINCT t1.LOAN_ID) AS TOTAL_LOANS_IN_COHORT,
+    
+    -- Performance: 30+ Days Past Due (Early Delinquency)
+    SUM(CASE WHEN t2.DAYS_PAST_DUE > 30 THEN 1 ELSE 0 END) AS DELINQUENCY_30_PLUS,
+    
+    -- Performance: 90+ Days Past Due (Hard Default)
+    SUM(CASE WHEN t2.DAYS_PAST_DUE > 90 THEN 1 ELSE 0 END) AS DEFAULT_90_PLUS,
+    
+    -- Rate Calculations
+    ROUND(
+        (SUM(CASE WHEN t2.DAYS_PAST_DUE > 30 THEN 1 ELSE 0 END) / 
+        NULLIF(COUNT(DISTINCT t1.LOAN_ID), 0)) * 100, 
+        2
+    ) AS DELINQUENCY_RATE_30_PCT,
+
+    ROUND(
+        (SUM(CASE WHEN t2.DAYS_PAST_DUE > 90 THEN 1 ELSE 0 END) / 
+        NULLIF(COUNT(DISTINCT t1.LOAN_ID), 0)) * 100, 
+        2
+    ) AS DEFAULT_RATE_90_PCT
+
+FROM
+    PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR t1
+LEFT JOIN (
+    SELECT 
+        LOAN_ID, 
+        DAYS_PAST_DUE,
+        _FIVETRAN_SYNCED
+    FROM 
+        RAW_PRODUCTION.LOANS_UK_CREDIT_LOANS_ARREARS.PAYMENTARREARS
+    -- Get the latest status snapshot
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY LOAN_ID ORDER BY _FIVETRAN_SYNCED DESC) = 1
+) t2 
+    -- Robust Join (String to String)
+    ON TO_VARCHAR(t1.LOAN_ID) = TO_VARCHAR(t2.LOAN_ID)
+
+WHERE
+    t1.FLAG_ORIGINATED = 1
+    AND t1.ORIGINATION_DATETIME >= '2023-01-01'
+
+GROUP BY
+    1, 2, 3
+HAVING
+    COUNT(DISTINCT t1.LOAN_ID) > 10 -- Filter out noise
+ORDER BY
+    1 DESC, 2, 3;
+
+
+
+/* 2. MULTI-DIMENSIONAL RISK ANALYSIS
+   - Dimensions: Channel, Risk Grade, Credit Score (Bucketed).
+   - Metrics: Volume, Loan Size, and Delinquency Rate.
+   - Purpose: Identify "Toxic Segments" (e.g., Low Score but High Loan Amount).
+*/
+
+SELECT
+    -- 1. The Channel Source
+    t1.INTRODUCER_CATEGORY AS CHANNEL,
+
+    -- 2. The Internal Risk Grade
+    t1.ORIGINATION_SIMPLIFIED_RISK_GRADE AS RISK_GRADE,
+
+    -- 3. Experian Delphi Score Band (Buckets of 50)
+    -- e.g., 600 becomes '600-649'
+    FLOOR(t1.DELPHI_SCORE / 50) * 50 AS DELPHI_SCORE_BAND,
+
+    -- Volume Context
+    COUNT(DISTINCT t1.LOAN_ID) AS TOTAL_LOANS,
+
+    -- Financial Context: Are we exposed to large loans in this segment?
+    ROUND(AVG(t1.FINAL_NET_AMOUNT), 0) AS AVG_LOAN_AMOUNT,
+
+    -- Performance: Default Rate (>90 Days Past Due)
+    ROUND(
+        (SUM(CASE WHEN t2.DAYS_PAST_DUE > 90 THEN 1 ELSE 0 END) / 
+        NULLIF(COUNT(DISTINCT t1.LOAN_ID), 0)) * 100, 
+        2
+    ) AS DEFAULT_RATE_PCT
+
+FROM
+    PROD.PRS_MOTOR.PRS__APPLICATION__MOTOR t1
+LEFT JOIN (
+    SELECT 
+        LOAN_ID, 
+        DAYS_PAST_DUE,
+        _FIVETRAN_SYNCED
+    FROM 
+        RAW_PRODUCTION.LOANS_UK_CREDIT_LOANS_ARREARS.PAYMENTARREARS
+    -- Get the latest snapshot
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY LOAN_ID ORDER BY _FIVETRAN_SYNCED DESC) = 1
+) t2 
+    ON TO_VARCHAR(t1.LOAN_ID) = TO_VARCHAR(t2.LOAN_ID)
+
+WHERE
+    t1.FLAG_ORIGINATED = 1
+    AND t1.ORIGINATION_DATETIME >= '2023-01-01'
+    AND t1.DELPHI_SCORE IS NOT NULL
+
+GROUP BY
+    1, 2, 3
+HAVING
+    COUNT(DISTINCT t1.LOAN_ID) > 10 -- Filter out tiny, noisy segments
+ORDER BY
+    1, 2, 3;
